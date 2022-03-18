@@ -11,7 +11,7 @@ from molpal import args, Explorer
 # ray.shutdown()
 
 arguments = '-o lookup -l libraries/Enamine10k.csv.gz --output-dir molpal_10k_jennatest -vvv \
---objective-config examples/objective/Enamine10k_lookup.ini'.split()
+--objective-config examples/objective/Enamine10k_lookup.ini --write-final --write-intermediate'.split()
 
 
 def sigterm_handler(signum, frame):
