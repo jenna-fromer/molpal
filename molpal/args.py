@@ -180,6 +180,9 @@ def add_model_args(parser: ArgumentParser) -> None:
     parser.add_argument('--model', choices=('rf', 'gp', 'nn', 'mpn'),
                         default='rf',
                         help='the model type to use')
+    parser.add_argument('--models', choices=('rf', 'gp', 'nn', 'mpn'),
+                        default=['rf','rf'], # change to account for # of taks 
+                        help='iterable string of the types of models to use') 
     parser.add_argument('--test-batch-size', type=int,
                         help='the size of batch of predictions during model inference. NOTE: This has nothing to do with model training/performance and might only affect the timing of the inference step. It is only useful to play with this parameter if performance is absolutely critical.')
     parser.add_argument('--retrain-from-scratch',
