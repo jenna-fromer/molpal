@@ -16,8 +16,10 @@ try:
 except ImportError:
     pass
 
-from molpal.utils import batches
-
+try: 
+    from molpal.utils import batches
+except: 
+    from utils import batches 
 
 @dataclass
 class Featurizer:
