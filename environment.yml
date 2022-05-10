@@ -6,7 +6,7 @@ channels:
 
 dependencies:
   # uncomment the corresponding line for your specific CUDA version
-  # - nvidia::cudatoolkit # for cuda >= 11
+  - nvidia::cudatoolkit # for cuda >= 11
   # - pytorch::cudatoolkit # for cuda < 11
   # - pytorch::cpuonly
   - python=3.8
