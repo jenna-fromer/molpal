@@ -12,6 +12,9 @@ import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorflow import keras
 
+import torch.nn as nn
+import torch 
+
 from molpal.featurizer import Featurizer, feature_matrix
 from molpal.models.base import Model
 
@@ -20,16 +23,28 @@ T_feat = TypeVar("T_feat")
 Dataset = tf.data.Dataset
 
 
+#def mve_loss(y_true, y_pred):
+#    mu = y_pred[:, 0]
+#    var = tf.math.softplus(y_pred[:, 1])
+#
+#    return tf.reduce_mean(
+#        tf.math.log(2 * 3.141592) / 2
+#        + tf.math.log(var) / 2
+#        + tf.math.square(mu - y_true) / (2 * var)
+#    )
+
 def mve_loss(y_true, y_pred):
-    mu = y_pred[:, 0]
-    var = tf.math.softplus(y_pred[:, 1])
+    if not isinstance(y_pred,torch.Tensor): y_pred = torch.Tensor(y_pred)
+    if not isinstance(y_true,torch.Tensor): y_true = torch.Tensor(y_pred)
+    mu = y_pred[:,0]
+    sp = nn.Softplus()
+    var = sp(y_pred[:,1])
 
-    return tf.reduce_mean(
-        tf.math.log(2 * 3.141592) / 2
-        + tf.math.log(var) / 2
-        + tf.math.square(mu - y_true) / (2 * var)
+    return torch.mean(
+        torch.log(torch.tensor(2 * 3.141592)) / 2
+        + torch.log(var) / 2
+        + torch.square(mu - y_true) / (2 * var)
     )
-
 
 class NN:
     """A feed-forward neural network model
