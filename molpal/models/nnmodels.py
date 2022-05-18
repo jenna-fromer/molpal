@@ -1,5 +1,6 @@
 """This module contains Model implementations that utilize an NN model as their
 underlying model"""
+from cgi import test
 from functools import partial
 import json
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
 from numpy import ndarray
+import pytorch_lightning as pl
+from pytorch_lightning import LightningModule
 from tqdm import tqdm
 import tensorflow as tf
 import tensorflow_addons as tfa
@@ -14,24 +17,36 @@ from tensorflow import keras
 
 import torch.nn as nn
 import torch 
+from torch.utils.data import Dataset, random_split, DataLoader
 
 from molpal.featurizer import Featurizer, feature_matrix
 from molpal.models.base import Model
 
 T = TypeVar("T")
 T_feat = TypeVar("T_feat")
-Dataset = tf.data.Dataset
+# Dataset = tf.data.Dataset
 
 
-#def mve_loss(y_true, y_pred):
-#    mu = y_pred[:, 0]
-#    var = tf.math.softplus(y_pred[:, 1])
-#
-#    return tf.reduce_mean(
-#        tf.math.log(2 * 3.141592) / 2
-#        + tf.math.log(var) / 2
-#        + tf.math.square(mu - y_true) / (2 * var)
-#    )
+class FingerprintDataset(Dataset):
+    """ A pytorch dataset containing a list of molecular fingerprints and output values """
+    def __init__(self, xs, ys, featurizer: Callable[[T], ndarray]):
+        self.X = feature_matrix(xs, featurizer)
+        self.y = self._normalize(ys)
+        self.len = len(self.X)
+
+    def __getitem__(self, index):
+        return self.X[index], self.y[index]
+
+    def __len__(self):
+        return self.len 
+    
+    def _normalize(self, ys: Sequence[float]) -> ndarray:
+        Y = np.stack(list(ys))
+        self.mean = np.nanmean(Y, axis=0)
+        self.std = np.nanstd(Y, axis=0)
+
+        return (Y - self.mean) / self.std
+
 
 def mve_loss(y_true, y_pred):
     if not isinstance(y_pred,torch.Tensor): y_pred = torch.Tensor(y_pred)
@@ -46,7 +61,7 @@ def mve_loss(y_true, y_pred):
         + torch.square(mu - y_true) / (2 * var)
     )
 
-class NN:
+class NN(LightningModule):
     """A feed-forward neural network model
 
     Attributes
@@ -99,6 +114,7 @@ class NN:
         uncertainty: Optional[str] = None,
         model_seed: Optional[int] = None,
     ):
+        super().__init__()
         self.input_size = input_size
         self.batch_size = batch_size
 
@@ -112,86 +128,62 @@ class NN:
         self.mean = 0
         self.std = 0
 
-        tf.random.set_seed(model_seed)
+        torch.manual_seed(model_seed)
 
     def build(self, input_size, num_tasks, layer_sizes, dropout, uncertainty, activation):
         """Build the model, optimizer, and loss function"""
         dropout_at_predict = uncertainty == "dropout"
         output_size = 2 * num_tasks if self.uncertainty else num_tasks
 
-        inputs = keras.layers.Input(shape=(input_size,))
+        activations = {'relu': nn.ReLU(), 
+                'tanh': nn.Tanh(), 
+                'sigmoid': nn.Sigmoid(), 
+                'leakyrelu': nn.LeakyReLU()
+                }
 
-        hidden = inputs
-        for layer_size in layer_sizes:
-            hidden = keras.layers.Dense(
-                units=layer_size,
-                activation=activation,
-                kernel_regularizer=keras.regularizers.l2(0.01),
-            )(hidden)
+        model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
 
-            if dropout:
-                hidden = keras.layers.Dropout(dropout)(hidden, training=dropout_at_predict)
-
-        outputs = keras.layers.Dense(output_size, activation="linear")(hidden)
-
-        model = keras.Model(inputs, outputs)
+        for i in range(1,len(layer_sizes)):
+            model.append(activations[activation])
+            if dropout: 
+                model.append(nn.Dropout(p=dropout))
+            model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
+        
+        model.append(activations[activation])
+        model.append(nn.Linear(layer_sizes[-1],output_size)) 
 
         if uncertainty not in {"mve"}:
-            optimizer = keras.optimizers.Adam(lr=0.01)
-            loss = keras.losses.mse
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
         elif uncertainty == "mve":
-            optimizer = keras.optimizers.Adam(lr=0.05)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
+        else:
+            raise ValueError(f'Unrecognized uncertainty method: "{uncertainty}"')
+
+        if uncertainty not in {"mve"}:
+            loss = nn.MSELoss()
+        elif uncertainty == "mve":
             loss = mve_loss
         else:
             raise ValueError(f'Unrecognized uncertainty method: "{uncertainty}"')
 
         return model, optimizer, loss
+    
+    def configure_optimizers(self):
+        if self.uncertainty not in {"mve"}:
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
+        elif self.uncertainty == "mve":
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=0.05)
+        else:
+            raise ValueError(f'Unrecognized uncertainty method: "{self.uncertainty}"')
+        return optimizer
+    
+    def training_step(self, train_batch: tuple, batch_idx):
+        X, y = train_batch
+        loss = self.loss(y.float(), self.model(X.float()))
+        return loss 
 
-    def train(
-        self, xs: Iterable[T], ys: Iterable[float], featurizer: Callable[[T], ndarray]
-    ) -> bool:
-        """Train the model on xs and ys with the given featurizer
-
-        Parameters
-        ----------
-        xs : Sequence[T]
-            an sequence of inputs in their identifier representations
-        ys : Sequence[float]
-            a parallel sequence of target values for these inputs
-        featurize : Callable[[T], ndarray]
-            a function that transforms an identifier into its uncompressed
-            feature representation
-
-        Returns
-        -------
-        True
-        """
-        self.model.compile(optimizer=self.optimizer, loss=self.loss)
-
-        X = np.array(feature_matrix(xs, featurizer))
-        Y = self._normalize(ys)
-
-        self.model.fit(
-            X,
-            Y,
-            batch_size=self.batch_size,
-            validation_split=0.2,
-            epochs=50,
-            validation_freq=2,
-            verbose=0,
-            callbacks=[
-                keras.callbacks.EarlyStopping(
-                    monitor="val_loss", patience=5, restore_best_weights=True, verbose=0
-                ),
-                tfa.callbacks.TQDMProgressBar(leave_epoch_progress=False),
-            ],
-        )
-
-        return True
-
-    def predict(self, xs: Sequence[ndarray]) -> ndarray:
-        X = np.stack(xs, axis=0)
-        Y_pred = self.model.predict(X)
+    def forward(self, x) -> ndarray:
+        Y_pred = self.model(x)
 
         if self.uncertainty == "mve":
             Y_pred[:, 0::2] = Y_pred[:, 0::2] * self.std + self.mean
@@ -269,8 +261,6 @@ class NNModel(Model):
         model_seed: Optional[int] = None,
         **kwargs,
     ):
-        test_batch_size = test_batch_size or 4096
-
         self.build_model = partial(
             NN,
             input_size=input_size,
@@ -280,8 +270,8 @@ class NNModel(Model):
             model_seed=model_seed,
         )
         self.model = self.build_model()
-
-        super().__init__(test_batch_size, **kwargs)
+        self.batch_size = test_batch_size
+        super().__init__(test_batch_size=test_batch_size)
 
     @property
     def provides(self):
@@ -298,14 +288,21 @@ class NNModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
+        epochs: int = 1000,
     ) -> bool:
+
         if retrain:
             self.model = self.build_model()
 
-        return self.model.train(xs, ys, featurizer)
+        train_dataloader, val_dataloader = self.make_dataloaders(xs, ys, featurizer)
+
+        trainer = pl.Trainer(devices=1 if torch.cuda.is_available() else None,
+                max_epochs=epochs)
+        trainer.fit(self.model, train_dataloader, val_dataloader) 
+        return self.model
 
     def get_means(self, xs: List) -> ndarray:
-        return self.model.predict(xs)[:, 0]
+        return self.model(xs)[:, 0]
 
     def get_means_and_vars(self, xs: List) -> NoReturn:
         raise TypeError("NNModel can't predict variances!")
@@ -315,6 +312,14 @@ class NNModel(Model):
 
     def load(self, path):
         self.model.load(path)
+    
+    def make_dataloaders(self, xs, ys, featurizer):
+        dataset = FingerprintDataset(xs, ys, featurizer)
+        lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))]
+        train_data, val_data = random_split(dataset, lengths)
+        train_dataloader = DataLoader(train_data, batch_size=self.batch_size)
+        val_dataloader = DataLoader(val_data, batch_size=self.batch_size)
+        return train_dataloader, val_dataloader
 
 
 class NNEnsembleModel(Model):
