@@ -5,17 +5,14 @@ from functools import partial
 import json
 from pathlib import Path
 from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple, TypeVar
-
 import numpy as np
 from numpy import ndarray
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule
+import ray 
 from ray import cluster_resources
 from tqdm import tqdm
-# import tensorflow as tf
-# import tensorflow_addons as tfa
-# from tensorflow import keras
-import ray 
+
 import torch.nn as nn
 import torch 
 from torch.utils.data import Dataset, random_split, DataLoader
@@ -31,7 +28,7 @@ T_feat = TypeVar("T_feat")
 class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
     def __init__(self, xs, ys, featurizer: Callable[[T], ndarray]):
-        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer)))
+        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer))) # Need to change to featurize() not feature_matrix()
         self.y = torch.Tensor(self._normalize(ys))
         self.len = len(self.X)
 
@@ -61,6 +58,22 @@ def mve_loss(y_true, y_pred):
         + torch.log(var) / 2
         + torch.square(mu - y_true) / (2 * var)
     )
+
+def make_dataloaders(xs, ys, featurizer, batch_size):
+    ''' Make a pytorch dataloader from xs (list of smiles strings) and 
+    ys (some outputs). Data is featurized using the provided featurizer '''
+    dataset = FingerprintDataset(xs, ys, featurizer)
+    lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))]
+    train_data, val_data = random_split(dataset, lengths)
+    train_dataloader = DataLoader(
+            train_data, 
+            batch_size=batch_size)
+            # num_workers=int(ray.cluster_resources()['CPU']))
+    val_dataloader = DataLoader(
+            val_data, 
+            batch_size=batch_size)
+            # num_workers=int(ray.cluster_resources()['CPU']))
+    return train_dataloader, val_dataloader
 
 class NN(LightningModule):
     """A feed-forward neural network model
@@ -129,7 +142,7 @@ class NN(LightningModule):
         self.mean = 0
         self.std = 0
 
-        torch.manual_seed(model_seed)
+        if model_seed: torch.manual_seed(model_seed)
 
     def build(self, input_size, num_tasks, layer_sizes, dropout, uncertainty, activation):
         """Build the model, optimizer, and loss function"""
@@ -304,15 +317,16 @@ class NNModel(Model):
         if retrain:
             self.model = self.build_model()
 
-        self.train_dataloader, self.val_dataloader = self.make_dataloaders(xs, ys, featurizer)
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, ys, featurizer, self.batch_size)
 
-        trainer = pl.Trainer(
+        self.trainer = pl.Trainer(
                 accelerator="auto",
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
-                log_every_n_steps=len(self.train_dataloader),
+                # log_every_n_steps=len(self.train_dataloader),
                 )
-        trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
+        self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
+
         return self.model
 
     def get_means(self, xs: List) -> ndarray:
@@ -326,20 +340,7 @@ class NNModel(Model):
 
     def load(self, path):
         self.model.load(path)
-    
-    def make_dataloaders(self, xs, ys, featurizer):
-        dataset = FingerprintDataset(xs, ys, featurizer)
-        lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))]
-        train_data, val_data = random_split(dataset, lengths)
-        train_dataloader = DataLoader(
-                train_data, 
-                batch_size=self.batch_size,)
-                # num_workers=int(ray.cluster_resources()['CPU']))
-        val_dataloader = DataLoader(
-                val_data, 
-                batch_size=self.batch_size,)
-                # num_workers=int(ray.cluster_resources()['CPU']))
-        return train_dataloader, val_dataloader
+
 
 
 class NNEnsembleModel(Model):
@@ -388,7 +389,7 @@ class NNEnsembleModel(Model):
 
         self.ensemble_size = ensemble_size
         self.models = [self.build_model() for _ in range(self.ensemble_size)]
-
+        self.batch_size = test_batch_size
         self.bootstrap_ensemble = bootstrap_ensemble  # TODO: Actually use this
 
         super().__init__(test_batch_size=test_batch_size, **kwargs)
@@ -408,11 +409,24 @@ class NNEnsembleModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
+        epochs: int = 500
     ):
         if retrain:
             self.models = [self.build_model() for _ in range(self.ensemble_size)]
+        
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, ys, featurizer, self.batch_size)
 
-        return all([model.train(xs, ys, featurizer) for model in self.models])
+        self.trainers = [ pl.Trainer(
+                accelerator="auto",
+                devices=1 if torch.cuda.is_available() else None,
+                max_epochs=epochs,
+                # log_every_n_steps=len(self.train_dataloader),
+                ) for _ in range(self.ensemble_size)]
+        
+        for i in tqdm(range(self.ensemble_size),desc='Ensemble Progress'):
+            self.trainers[i].fit(self.models[i], self.train_dataloader, self.val_dataloader) 
+      
+        return self.models
 
     def get_means(self, xs: Sequence) -> np.ndarray:
         preds = np.zeros((len(xs), len(self.models)))
