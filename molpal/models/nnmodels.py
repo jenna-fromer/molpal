@@ -10,11 +10,12 @@ import numpy as np
 from numpy import ndarray
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule
+from ray import cluster_resources
 from tqdm import tqdm
-import tensorflow as tf
-import tensorflow_addons as tfa
-from tensorflow import keras
-
+# import tensorflow as tf
+# import tensorflow_addons as tfa
+# from tensorflow import keras
+import ray 
 import torch.nn as nn
 import torch 
 from torch.utils.data import Dataset, random_split, DataLoader
@@ -30,8 +31,8 @@ T_feat = TypeVar("T_feat")
 class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
     def __init__(self, xs, ys, featurizer: Callable[[T], ndarray]):
-        self.X = feature_matrix(xs, featurizer)
-        self.y = self._normalize(ys)
+        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer)))
+        self.y = torch.Tensor(self._normalize(ys))
         self.len = len(self.X)
 
     def __getitem__(self, index):
@@ -181,6 +182,12 @@ class NN(LightningModule):
         X, y = train_batch
         loss = self.loss(y.float(), self.model(X.float()))
         return loss 
+    
+    def validation_step(self, batch: tuple, batch_idx):
+        X, y = batch
+        loss = self.loss(y.float(), self.model(X.float()))
+        self.log("val_loss", loss, prog_bar=True)
+        return loss 
 
     def forward(self, x) -> ndarray:
         Y_pred = self.model(x)
@@ -198,7 +205,8 @@ class NN(LightningModule):
         path.mkdir(parents=True, exist_ok=True)
 
         model_path = f"{path}/model"
-        self.model.save(model_path, include_optimizer=True)
+        torch.save(self.model.state_dict(), model_path)
+        # self.model.save(model_path, include_optimizer=True)
 
         state_path = f"{path}/state.json"
         state = {"std": self.std, "mean": self.mean, "model_path": model_path}
@@ -218,7 +226,9 @@ class NN(LightningModule):
         else:
             custom_objects = {}
 
-        self.model = keras.models.load_model(model_path, custom_objects=custom_objects)
+        self.model.load_state_dict(torch.load(model_path))
+        # self.model = keras.models.load_model(model_path, custom_objects=custom_objects)
+
 
     def _normalize(self, ys: Sequence[float]) -> ndarray:
         Y = np.stack(list(ys))
@@ -288,17 +298,21 @@ class NNModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
-        epochs: int = 1000,
+        epochs: int = 500,
     ) -> bool:
 
         if retrain:
             self.model = self.build_model()
 
-        train_dataloader, val_dataloader = self.make_dataloaders(xs, ys, featurizer)
+        self.train_dataloader, self.val_dataloader = self.make_dataloaders(xs, ys, featurizer)
 
-        trainer = pl.Trainer(devices=1 if torch.cuda.is_available() else None,
-                max_epochs=epochs)
-        trainer.fit(self.model, train_dataloader, val_dataloader) 
+        trainer = pl.Trainer(
+                accelerator="auto",
+                devices=1 if torch.cuda.is_available() else None,
+                max_epochs=epochs,
+                log_every_n_steps=len(self.train_dataloader),
+                )
+        trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
         return self.model
 
     def get_means(self, xs: List) -> ndarray:
@@ -317,8 +331,14 @@ class NNModel(Model):
         dataset = FingerprintDataset(xs, ys, featurizer)
         lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))]
         train_data, val_data = random_split(dataset, lengths)
-        train_dataloader = DataLoader(train_data, batch_size=self.batch_size)
-        val_dataloader = DataLoader(val_data, batch_size=self.batch_size)
+        train_dataloader = DataLoader(
+                train_data, 
+                batch_size=self.batch_size,)
+                # num_workers=int(ray.cluster_resources()['CPU']))
+        val_dataloader = DataLoader(
+                val_data, 
+                batch_size=self.batch_size,)
+                # num_workers=int(ray.cluster_resources()['CPU']))
         return train_dataloader, val_dataloader
 
 
