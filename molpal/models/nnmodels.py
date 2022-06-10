@@ -9,13 +9,17 @@ import numpy as np
 from numpy import ndarray
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import ray 
 from ray import cluster_resources
+from sqlalchemy import Float
 from tqdm import tqdm
 
 import torch.nn as nn
+from torch.nn import functional 
 import torch 
 from torch.utils.data import Dataset, random_split, DataLoader
+from traitlets import Int
 
 from molpal.featurizer import Featurizer, feature_matrix
 from molpal.models.base import Model
@@ -27,14 +31,13 @@ T_feat = TypeVar("T_feat")
 
 class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
-    def __init__(self, xs, ys, featurizer: Featurizer):  
-        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer))) # can get rid of np.array here 
-        # ^ could also use featurize(smi) for smi in xs
-        self.y = torch.Tensor(self._normalize(ys)) # change to lowercase t 
-        self.len = len(self.X) # instead lowercase xs 
+    def __init__(self, xs: Iterable[T], ys: Sequence[float], featurizer: Featurizer):  
+        self.X = torch.tensor(feature_matrix(xs, featurizer)) 
+        self.y = torch.tensor(self._normalize(ys)) # may need to turn into appropriate float 
+        self.len = len(list(xs))
         # add self.xs = list(xs) which confirms that it isnt an iterator
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: Int):
         return self.X[index], self.y[index]
 
     def __len__(self):
@@ -49,11 +52,12 @@ class FingerprintDataset(Dataset):
 
 
 def mve_loss(y_true, y_pred):
-    if not isinstance(y_pred,torch.Tensor): y_pred = torch.Tensor(y_pred) # no one line ifs
-    if not isinstance(y_true,torch.Tensor): y_true = torch.Tensor(y_pred) # no one line ifs 
+    if not isinstance(y_pred,torch.Tensor): 
+        y_pred = torch.Tensor(y_pred)
+    if not isinstance(y_true,torch.Tensor): 
+        y_true = torch.Tensor(y_pred)
     mu = y_pred[:,0]
-    sp = nn.Softplus() # replace: from torch.nn import functional as F, F.softplus()
-    var = sp(y_pred[:,1])
+    var = functional.softplus(y_pred[:,1])
 
     return torch.mean(
         torch.log(torch.tensor(2 * 3.141592)) / 2 # use built in constant
@@ -71,11 +75,11 @@ def make_dataloaders(xs, ys, featurizer, batch_size):
     train_dataloader = DataLoader(
             train_data, 
             batch_size=batch_size)
-            # num_workers=int(ray.cluster_resources()['CPU']))
+            # num_workers=int(ray.cluster_resources()['CPU'])) # not used because featurizer not called on the fly
     val_dataloader = DataLoader(
             val_data, 
             batch_size=batch_size)
-            # num_workers=int(ray.cluster_resources()['CPU']))
+            # num_workers=int(ray.cluster_resources()['CPU'])) # not used because featurizer not called on the fly
     return train_dataloader, val_dataloader
 
 class NN(LightningModule):
@@ -125,7 +129,7 @@ class NN(LightningModule):
         input_size: int,
         num_tasks: int,
         batch_size: int = 4096,
-        layer_sizes: Optional[Sequence[int]] = None,
+        layer_sizes: Optional[Sequence[int]] = [100, 100],
         dropout: Optional[float] = None,
         activation: Optional[str] = "relu",
         uncertainty: Optional[str] = None,
@@ -137,20 +141,17 @@ class NN(LightningModule):
 
         self.uncertainty = uncertainty
 
-        layer_sizes = layer_sizes or [100, 100]
-        self.model, self.optimizer, self.loss = self.build(
-            input_size, num_tasks, layer_sizes, dropout, self.uncertainty, activation
-        )
-
         self.mean = 0
-        self.std = 0 # change to 1, but make sure that this is changed at some point
+        self.std = 1 
 
-        if model_seed: torch.manual_seed(model_seed)
+        if model_seed: 
+            torch.manual_seed(model_seed)
 
-    def build(self, input_size, num_tasks, layer_sizes, dropout, uncertainty, activation):
-        """Build the model, optimizer, and loss function"""
         dropout_at_predict = uncertainty == "dropout"
-        output_size = 2 * num_tasks if self.uncertainty else num_tasks
+        if self.uncertainty:
+            output_size = 2*num_tasks
+        else:
+            output_size = num_tasks
 
         activations = {'relu': nn.ReLU(), 
                 'tanh': nn.Tanh(), 
@@ -158,32 +159,23 @@ class NN(LightningModule):
                 'leakyrelu': nn.LeakyReLU()
                 }
 
-        model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
+        self.model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
         # see chemprop blob sent 
         for i in range(1,len(layer_sizes)):
-            model.append(activations[activation])
+            self.model.append(activations[activation])
             if dropout: 
-                model.append(nn.Dropout(p=dropout))
-            model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
+                self.model.append(nn.Dropout(p=dropout))
+            self.model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
         
-        model.append(activations[activation])
-        model.append(nn.Linear(layer_sizes[-1],output_size)) 
-# can delete entire thing here, config_optimizrs done by pt 
-        if uncertainty not in {"mve"}:
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.01) # not sure why LR different with uncertainty, but did not change  
-        elif uncertainty == "mve":
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
-        else:
-            raise ValueError(f'Unrecognized uncertainty method: "{uncertainty}"')
+        self.model.append(activations[activation])
+        self.model.append(nn.Linear(layer_sizes[-1],output_size)) 
 
         if uncertainty not in {"mve"}:
-            loss = nn.MSELoss()
+            self.loss = nn.MSELoss()
         elif uncertainty == "mve":
-            loss = mve_loss
+            self.loss = mve_loss
         else:
             raise ValueError(f'Unrecognized uncertainty method: "{uncertainty}"')
-
-        return model, optimizer, loss
     
     def configure_optimizers(self):
         if self.uncertainty not in {"mve"}:
@@ -196,12 +188,12 @@ class NN(LightningModule):
     
     def training_step(self, train_batch: tuple, batch_idx):
         X, y = train_batch
-        loss = self.loss(y.float(), self.model(X.float())) # .float change in dataset, lowercase torch might help
+        loss = self.loss(y, self.model(X)) 
         return loss 
     
     def validation_step(self, batch: tuple, batch_idx):
         X, y = batch
-        loss = self.loss(y.float(), self.model(X.float()))
+        loss = self.loss(y, self.model(X))
         self.log("val_loss", loss, prog_bar=True)
         return loss 
 
@@ -297,7 +289,7 @@ class NNModel(Model):
         )
         self.model = self.build_model()
         self.batch_size = test_batch_size
-        super().__init__(test_batch_size=test_batch_size) # check about kwargs
+        super().__init__(test_batch_size=test_batch_size, **kwargs)
 
     @property
     def provides(self):
@@ -326,6 +318,7 @@ class NNModel(Model):
                 accelerator="auto",
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
+                callbacks=[EarlyStopping(monitor="val_loss", mode="min")]
                 # log_every_n_steps=len(self.train_dataloader),
                 ) # need to add early stopping 
         self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
