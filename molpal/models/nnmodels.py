@@ -197,17 +197,6 @@ class NN(LightningModule):
         self.log("val_loss", loss, prog_bar=True)
         return loss 
 
-    def forward(self, x) -> ndarray:
-        Y_pred = self.model(x)
-
-        if self.uncertainty == "mve":
-            Y_pred[:, 0::2] = Y_pred[:, 0::2] * self.std + self.mean
-            Y_pred[:, 1::2] = Y_pred[:, 1::2] * self.std ** 2
-        else:
-            Y_pred = Y_pred * self.std + self.mean
-
-        return Y_pred
-
     def save(self, path) -> str:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
