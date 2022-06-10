@@ -1,6 +1,6 @@
 """This module contains Model implementations that utilize an NN model as their
 underlying model"""
-from cgi import test
+from cgi import test # get rid of this 
 from functools import partial
 import json
 from pathlib import Path
@@ -27,10 +27,12 @@ T_feat = TypeVar("T_feat")
 
 class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
-    def __init__(self, xs, ys, featurizer: Callable[[T], ndarray]):
-        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer))) # Need to change to featurize() not feature_matrix()
-        self.y = torch.Tensor(self._normalize(ys))
-        self.len = len(self.X)
+    def __init__(self, xs, ys, featurizer: Featurizer):  
+        self.X = torch.Tensor(np.array(feature_matrix(xs, featurizer))) # can get rid of np.array here 
+        # ^ could also use featurize(smi) for smi in xs
+        self.y = torch.Tensor(self._normalize(ys)) # change to lowercase t 
+        self.len = len(self.X) # instead lowercase xs 
+        # add self.xs = list(xs) which confirms that it isnt an iterator
 
     def __getitem__(self, index):
         return self.X[index], self.y[index]
@@ -47,24 +49,25 @@ class FingerprintDataset(Dataset):
 
 
 def mve_loss(y_true, y_pred):
-    if not isinstance(y_pred,torch.Tensor): y_pred = torch.Tensor(y_pred)
-    if not isinstance(y_true,torch.Tensor): y_true = torch.Tensor(y_pred)
+    if not isinstance(y_pred,torch.Tensor): y_pred = torch.Tensor(y_pred) # no one line ifs
+    if not isinstance(y_true,torch.Tensor): y_true = torch.Tensor(y_pred) # no one line ifs 
     mu = y_pred[:,0]
-    sp = nn.Softplus()
+    sp = nn.Softplus() # replace: from torch.nn import functional as F, F.softplus()
     var = sp(y_pred[:,1])
 
     return torch.mean(
-        torch.log(torch.tensor(2 * 3.141592)) / 2
+        torch.log(torch.tensor(2 * 3.141592)) / 2 # use built in constant
         + torch.log(var) / 2
-        + torch.square(mu - y_true) / (2 * var)
+        + torch.square(mu - y_true) / (2 * var) # or **2, same thing as squared
     )
 
 def make_dataloaders(xs, ys, featurizer, batch_size):
     ''' Make a pytorch dataloader from xs (list of smiles strings) and 
     ys (some outputs). Data is featurized using the provided featurizer '''
+    # change to allow for input split value
     dataset = FingerprintDataset(xs, ys, featurizer)
-    lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))]
-    train_data, val_data = random_split(dataset, lengths)
+    lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))] 
+    train_data, val_data = random_split(dataset, lengths) # add seed argument, never set to a constant value
     train_dataloader = DataLoader(
             train_data, 
             batch_size=batch_size)
@@ -140,7 +143,7 @@ class NN(LightningModule):
         )
 
         self.mean = 0
-        self.std = 0
+        self.std = 0 # change to 1, but make sure that this is changed at some point
 
         if model_seed: torch.manual_seed(model_seed)
 
@@ -156,7 +159,7 @@ class NN(LightningModule):
                 }
 
         model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
-
+        # see chemprop blob sent 
         for i in range(1,len(layer_sizes)):
             model.append(activations[activation])
             if dropout: 
@@ -165,9 +168,9 @@ class NN(LightningModule):
         
         model.append(activations[activation])
         model.append(nn.Linear(layer_sizes[-1],output_size)) 
-
+# can delete entire thing here, config_optimizrs done by pt 
         if uncertainty not in {"mve"}:
-            optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+            optimizer = torch.optim.Adam(model.parameters(), lr=0.01) # not sure why LR different with uncertainty, but did not change  
         elif uncertainty == "mve":
             optimizer = torch.optim.Adam(model.parameters(), lr=0.05)
         else:
@@ -193,7 +196,7 @@ class NN(LightningModule):
     
     def training_step(self, train_batch: tuple, batch_idx):
         X, y = train_batch
-        loss = self.loss(y.float(), self.model(X.float()))
+        loss = self.loss(y.float(), self.model(X.float())) # .float change in dataset, lowercase torch might help
         return loss 
     
     def validation_step(self, batch: tuple, batch_idx):
@@ -294,7 +297,7 @@ class NNModel(Model):
         )
         self.model = self.build_model()
         self.batch_size = test_batch_size
-        super().__init__(test_batch_size=test_batch_size)
+        super().__init__(test_batch_size=test_batch_size) # check about kwargs
 
     @property
     def provides(self):
@@ -324,7 +327,7 @@ class NNModel(Model):
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
                 # log_every_n_steps=len(self.train_dataloader),
-                )
+                ) # need to add early stopping 
         self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
 
         return self.model
