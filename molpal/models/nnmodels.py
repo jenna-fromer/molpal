@@ -65,7 +65,7 @@ def mve_loss(y_true, y_pred):
         + torch.square(mu - y_true) / (2 * var) # or **2, same thing as squared
     )
 
-def make_dataloaders(xs, ys, featurizer, batch_size):
+def make_dataloaders(xs: Iterable[T], ys: Sequence[float], featurizer, batch_size):
     ''' Make a pytorch dataloader from xs (list of smiles strings) and 
     ys (some outputs). Data is featurized using the provided featurizer '''
     # change to allow for input split value
@@ -266,18 +266,30 @@ class NNModel(Model):
         test_batch_size: Optional[int] = 4096,
         dropout: Optional[float] = 0.0,
         model_seed: Optional[int] = None,
+        layer_sizes: Optional[List] = [100,100],
+        activation: Optional[str] = "relu",
         **kwargs,
     ):
-        self.build_model = partial(
-            NN,
-            input_size=input_size,
-            num_tasks=1,
-            batch_size=test_batch_size,
-            dropout=dropout,
-            model_seed=model_seed,
-        )
-        self.model = self.build_model()
+        self.input_size = input_size
+        self.test_batch_size = test_batch_size
+        self.dropout = dropout
+        self.model_seed = model_seed
+        self.layer_sizes = layer_sizes
+        self.activation = activation
         self.batch_size = test_batch_size
+
+        self.model = NN(
+            input_size=self.input_size,
+            num_tasks=1,
+            batch_size=self.test_batch_size,
+            layer_sizes = self.layer_sizes,
+            dropout=self.dropout,
+            activation=self.activation,
+            model_seed=self.model_seed
+        )
+
+        self.std = 1 # to be redefined in self.train()
+        self.mean = 0 # to be redefined in self.train()
         super().__init__(test_batch_size=test_batch_size, **kwargs)
 
     @property
@@ -298,18 +310,31 @@ class NNModel(Model):
         epochs: int = 500,
     ) -> bool:
 
-        if retrain:
-            self.model = self.build_model()
+        self.std = np.mean(ys)
+        self.mean = np.std(ys)
+        
+        # make sure data is normalized!!! 
 
-        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, ys, featurizer, self.batch_size)
+        if retrain:
+            self.model = NN(
+                input_size=self.input_size,
+                num_tasks=1,
+                batch_size=self.test_batch_size,
+                layer_sizes = self.layer_sizes,
+                dropout=self.dropout,
+                activation=self.activation,
+                model_seed=self.model_seed
+            )
+
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, batch_size=self.batch_size)
 
         self.trainer = pl.Trainer(
                 accelerator="auto",
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
-                callbacks=[EarlyStopping(monitor="val_loss", mode="min")]
+                callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)],
                 # log_every_n_steps=len(self.train_dataloader),
-                ) # need to add early stopping 
+                )
         self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
 
         return self.model
@@ -325,6 +350,12 @@ class NNModel(Model):
 
     def load(self, path):
         self.model.load(path)
+    
+    def normalize(self, ys):
+        return (ys-self.mean)/self.std
+
+    def unnormalize(self, y_pred):
+        return y_pred*self.std + self.mean
 
 
 
