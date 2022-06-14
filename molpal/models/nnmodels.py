@@ -1,10 +1,11 @@
 """This module contains Model implementations that utilize an NN model as their
 underlying model"""
-from cgi import test # get rid of this 
+from cmath import pi
 from functools import partial
 import json
 from pathlib import Path
-from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple, TypeVar
+from types import NoneType
+from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple, TypeVar, Union, NoneType
 import numpy as np
 from numpy import ndarray
 import pytorch_lightning as pl
@@ -14,7 +15,7 @@ import ray
 from ray import cluster_resources
 from sqlalchemy import Float
 from tqdm import tqdm
-
+from math import pi
 import torch.nn as nn
 from torch.nn import functional 
 import torch 
@@ -33,21 +34,20 @@ class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
     def __init__(self, xs: Iterable[T], ys: Sequence[float], featurizer: Featurizer):  
         self.X = torch.tensor(feature_matrix(xs, featurizer)) 
-        self.y = torch.tensor(self._normalize(ys)) # may need to turn into appropriate float 
+        self.y = torch.tensor(self._normalize(ys)) 
         self.len = len(list(xs))
-        # add self.xs = list(xs) which confirms that it isnt an iterator
+        self.xs = list(xs) 
 
-    def __getitem__(self, index: Int):
+    def __getitem__(self, index: Int) -> Tuple[torch.tensor,torch.tensor]:
         return self.X[index], self.y[index]
 
-    def __len__(self):
+    def __len__(self) -> Int:
         return self.len 
     
     def _normalize(self, ys: Sequence[float]) -> ndarray:
         Y = np.stack(list(ys))
         self.mean = np.nanmean(Y, axis=0)
         self.std = np.nanstd(Y, axis=0)
-
         return (Y - self.mean) / self.std
 
 
@@ -60,26 +60,34 @@ def mve_loss(y_true, y_pred):
     var = functional.softplus(y_pred[:,1])
 
     return torch.mean(
-        torch.log(torch.tensor(2 * 3.141592)) / 2 # use built in constant
+        torch.log(torch.tensor(2 * pi)) / 2 # use built in constant
         + torch.log(var) / 2
         + torch.square(mu - y_true) / (2 * var) # or **2, same thing as squared
     )
 
-def make_dataloaders(xs: Iterable[T], ys: Sequence[float], featurizer, batch_size):
+def make_dataloaders(
+        xs: Iterable[T], 
+        ys: Sequence[float], 
+        featurizer: Featurizer, 
+        batch_size: int, 
+        val_split: Optional[Float] = 0.2, 
+        manual_seed: Optional[Union[None,Int]] = None,
+    ) -> Tuple[DataLoader]:
     ''' Make a pytorch dataloader from xs (list of smiles strings) and 
     ys (some outputs). Data is featurized using the provided featurizer '''
-    # change to allow for input split value
+
     dataset = FingerprintDataset(xs, ys, featurizer)
-    lengths = [int(0.8*len(dataset)), len(dataset)-int(0.8*len(dataset))] 
-    train_data, val_data = random_split(dataset, lengths) # add seed argument, never set to a constant value
+    train_len = int((1-val_split)*len(dataset))
+    lengths = [train_len, len(dataset)-train_len] 
+    if manual_seed:
+        torch.manual_seed(manual_seed)
+    train_data, val_data = random_split(dataset, lengths) 
     train_dataloader = DataLoader(
             train_data, 
             batch_size=batch_size)
-            # num_workers=int(ray.cluster_resources()['CPU'])) # not used because featurizer not called on the fly
     val_dataloader = DataLoader(
             val_data, 
             batch_size=batch_size)
-            # num_workers=int(ray.cluster_resources()['CPU'])) # not used because featurizer not called on the fly
     return train_dataloader, val_dataloader
 
 class NN(LightningModule):
@@ -136,18 +144,17 @@ class NN(LightningModule):
         model_seed: Optional[int] = None,
     ):
         super().__init__()
+
         self.input_size = input_size
         self.batch_size = batch_size
-
         self.uncertainty = uncertainty
 
-        self.mean = 0
-        self.std = 1 
+        self.mean = 0 # to be mutated in self.train() later
+        self.std = 1 # to be mutated in self.train()
 
         if model_seed: 
             torch.manual_seed(model_seed)
 
-        dropout_at_predict = uncertainty == "dropout"
         if self.uncertainty:
             output_size = 2*num_tasks
         else:
@@ -168,6 +175,8 @@ class NN(LightningModule):
             self.model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
         
         self.model.append(activations[activation])
+        if dropout: 
+                self.model.append(nn.Dropout(p=dropout))
         self.model.append(nn.Linear(layer_sizes[-1],output_size)) 
 
         if uncertainty not in {"mve"}:
@@ -203,7 +212,6 @@ class NN(LightningModule):
 
         model_path = f"{path}/model"
         torch.save(self.model.state_dict(), model_path)
-        # self.model.save(model_path, include_optimizer=True)
 
         state_path = f"{path}/state.json"
         state = {"std": self.std, "mean": self.mean, "model_path": model_path}
@@ -211,7 +219,7 @@ class NN(LightningModule):
 
         return state_path
 
-    def load(self, path):
+    def load(self, path) -> Model:
         state = json.load(open(path, "r"))
 
         model_path = state["model_path"]
@@ -224,15 +232,8 @@ class NN(LightningModule):
             custom_objects = {}
 
         self.model.load_state_dict(torch.load(model_path))
-        # self.model = keras.models.load_model(model_path, custom_objects=custom_objects)
-
-
-    def _normalize(self, ys: Sequence[float]) -> ndarray:
-        Y = np.stack(list(ys))
-        self.mean = np.nanmean(Y, axis=0)
-        self.std = np.nanstd(Y, axis=0)
-
-        return (Y - self.mean) / self.std
+        
+        return self.model
 
 
 class NNModel(Model):
@@ -278,6 +279,9 @@ class NNModel(Model):
         self.activation = activation
         self.batch_size = test_batch_size
 
+        if self.model_seed: 
+            torch.manual_seed(model_seed)
+
         self.model = NN(
             input_size=self.input_size,
             num_tasks=1,
@@ -308,7 +312,8 @@ class NNModel(Model):
         featurizer: Featurizer,
         retrain: bool = False,
         epochs: int = 500,
-    ) -> bool:
+        early_stopping: bool = True,
+    ) -> Model:
 
         self.std = np.mean(ys)
         self.mean = np.std(ys)
@@ -328,19 +333,23 @@ class NNModel(Model):
 
         self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, batch_size=self.batch_size)
 
+        if early_stopping: 
+            callbacks = [EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)]
+        else: 
+            callbacks = []
+
         self.trainer = pl.Trainer(
                 accelerator="auto",
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
-                callbacks=[EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)],
-                # log_every_n_steps=len(self.train_dataloader),
+                callbacks=callbacks,
                 )
         self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
 
         return self.model
 
     def get_means(self, xs: List) -> ndarray:
-        return self.model(xs)[:, 0]
+        return self.model(xs)[:, 0] # why is it this way?? 
 
     def get_means_and_vars(self, xs: List) -> NoReturn:
         raise TypeError("NNModel can't predict variances!")
@@ -356,7 +365,6 @@ class NNModel(Model):
 
     def unnormalize(self, y_pred):
         return y_pred*self.std + self.mean
-
 
 
 class NNEnsembleModel(Model):
@@ -391,23 +399,36 @@ class NNEnsembleModel(Model):
         ensemble_size: int = 5,
         bootstrap_ensemble: Optional[bool] = False,
         model_seed: Optional[int] = None,
+        layer_sizes: Optional[List] = [100,100],
+        activation: Optional[str] = "relu",
         **kwargs,
     ):
-        test_batch_size = test_batch_size or 4096
-        self.build_model = partial(
-            NN,
-            input_size=input_size,
-            num_tasks=1,
-            batch_size=test_batch_size,
-            dropout=dropout,
-            model_seed=model_seed,
-        )
-
-        self.ensemble_size = ensemble_size
-        self.models = [self.build_model() for _ in range(self.ensemble_size)]
+        self.input_size = input_size
+        self.test_batch_size = test_batch_size
+        self.dropout = dropout
+        self.model_seed = model_seed
+        self.layer_sizes = layer_sizes
+        self.activation = activation
         self.batch_size = test_batch_size
+        self.ensemble_size = ensemble_size        
         self.bootstrap_ensemble = bootstrap_ensemble  # TODO: Actually use this
 
+        if self.model_seed: # NOT RECOMMENDED, ALL MODELS WILL INITIALIZE IDENTICALLY
+            print('Same random seed being used for ensemble model initiation! (Bad)')
+            torch.manual_seed(model_seed)
+        
+        self.models = [NN(
+                input_size=self.input_size,
+                num_tasks=1,
+                batch_size=self.test_batch_size,
+                layer_sizes = self.layer_sizes,
+                dropout=self.dropout,
+                activation=self.activation,
+                model_seed=self.model_seed
+            ) for _ in range(self.ensemble_size)]
+
+        self.std = 1 # to be redefined in self.train()
+        self.mean = 0 # to be redefined in self.train()
         super().__init__(test_batch_size=test_batch_size, **kwargs)
 
     @property
@@ -425,12 +446,25 @@ class NNEnsembleModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
-        epochs: int = 500
-    ):
+        epochs: int = 500,
+        early_stopping: bool = True
+    ) -> List[Model]:
+
+        self.std = np.mean(ys)
+        self.mean = np.std(ys)
+
         if retrain:
-            self.models = [self.build_model() for _ in range(self.ensemble_size)]
-        
-        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, ys, featurizer, self.batch_size)
+            self.models = [NN(
+                input_size=self.input_size,
+                num_tasks=1,
+                batch_size=self.test_batch_size,
+                layer_sizes = self.layer_sizes,
+                dropout=self.dropout,
+                activation=self.activation,
+                model_seed=self.model_seed
+            ) for _ in range(self.ensemble_size)]
+
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, self.batch_size)
 
         self.trainers = [ pl.Trainer(
                 accelerator="auto",
@@ -449,7 +483,7 @@ class NNEnsembleModel(Model):
         for j, model in tqdm(
             enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
         ):
-            preds[:, j] = model.predict(xs)[:, 0]
+            preds[:, j] = self.unnormalize(model.predict(xs)[:, 0])
 
         return np.mean(preds, axis=1)
 
@@ -458,7 +492,7 @@ class NNEnsembleModel(Model):
         for j, model in tqdm(
             enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
         ):
-            preds[:, j] = model.predict(xs)[:, 0]
+            preds[:, j] = self.unnormalize(model.predict(xs)[:, 0])
 
         return np.mean(preds, axis=1), np.var(preds, axis=1)
 
@@ -471,7 +505,12 @@ class NNEnsembleModel(Model):
     def load(self, path):
         for model, model_path in zip(self.models, path.iterdir()):
             model.load(model_path)
+    
+    def normalize(self, ys):
+        return (ys-self.mean)/self.std
 
+    def unnormalize(self, y_pred):
+        return y_pred*self.std + self.mean 
 
 class NNTwoOutputModel(Model):
     """Feed forward neural network with two outputs so it learns to predict
