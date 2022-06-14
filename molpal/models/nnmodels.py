@@ -620,24 +620,25 @@ class NNTwoOutputModel(Model):
         return self.model
 
     def get_means(self, xs: Sequence) -> np.ndarray:
-        preds = self.model(xs)
-        return preds[:, 0]
+        preds = self.unnormalize(self.model(xs))
+        return self.unnormalize(preds[:, 0])
 
     def get_means_and_vars(self, xs: Sequence) -> Tuple[ndarray, ndarray]:
-        preds = self.model.predict(xs)
-        return preds[:, 0], self._safe_softplus(preds[:, 1])
+        preds = self.model(xs)
+        return self.unnormalize(preds[:, 0]), functional.softplus(preds[:, 1])
 
     def save(self, path) -> str:
         return self.model.save(path)
 
     def load(self, path):
         self.model.load(path)
+    
+    def normalize(self, ys):
+        return (ys-self.mean)/self.std
 
-    @classmethod
-    def _safe_softplus(cls, xs):
-        in_range = xs < 100
-        return np.log(1 + np.exp(xs * in_range)) * in_range + xs * (1 - in_range)
-
+    def unnormalize(self, means):
+        return means*self.std + self.mean
+ 
 
 class NNDropoutModel(Model):
     """Feed forward neural network that uses MC dropout for UQ
