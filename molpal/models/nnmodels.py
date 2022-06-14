@@ -138,7 +138,7 @@ class NN(LightningModule):
         num_tasks: int,
         batch_size: int = 4096,
         layer_sizes: Optional[Sequence[int]] = [100, 100],
-        dropout: Optional[float] = None,
+        dropout: Optional[float] = 0.0,
         activation: Optional[str] = "relu",
         uncertainty: Optional[str] = None,
         model_seed: Optional[int] = None,
@@ -170,13 +170,11 @@ class NN(LightningModule):
         # see chemprop blob sent 
         for i in range(1,len(layer_sizes)):
             self.model.append(activations[activation])
-            if dropout: 
-                self.model.append(nn.Dropout(p=dropout))
+            self.model.append(nn.Dropout(p=dropout))
             self.model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
         
         self.model.append(activations[activation])
-        if dropout: 
-                self.model.append(nn.Dropout(p=dropout))
+        self.model.append(nn.Dropout(p=dropout))
         self.model.append(nn.Linear(layer_sizes[-1],output_size)) 
 
         if uncertainty not in {"mve"}:
@@ -205,6 +203,9 @@ class NN(LightningModule):
         loss = self.loss(y, self.model(X))
         self.log("val_loss", loss, prog_bar=True)
         return loss 
+
+    def forward(self,x): 
+        return self.model(x)
 
     def save(self, path) -> str:
         path = Path(path)
@@ -318,8 +319,6 @@ class NNModel(Model):
         self.std = np.mean(ys)
         self.mean = np.std(ys)
         
-        # make sure data is normalized!!! 
-
         if retrain:
             self.model = NN(
                 input_size=self.input_size,
@@ -538,21 +537,35 @@ class NNTwoOutputModel(Model):
         test_batch_size: Optional[int] = 4096,
         dropout: Optional[float] = 0.0,
         model_seed: Optional[int] = None,
+        layer_sizes: Optional[List] = [100,100],
+        activation: Optional[str] = "relu",
         **kwargs,
     ):
-        test_batch_size = test_batch_size or 4096
 
-        self.build_model = partial(
-            NN,
-            input_size=input_size,
+        self.input_size = input_size
+        self.test_batch_size = test_batch_size
+        self.dropout = dropout
+        self.model_seed = model_seed
+        self.layer_sizes = layer_sizes
+        self.activation = activation
+        self.batch_size = test_batch_size
+
+        if self.model_seed: 
+            torch.manual_seed(model_seed)
+
+        self.model = NN(
+            input_size=self.input_size,
             num_tasks=1,
-            batch_size=test_batch_size,
-            dropout=dropout,
-            uncertainty="mve",
-            model_seed=model_seed,
+            batch_size=self.test_batch_size,
+            layer_sizes = self.layer_sizes,
+            dropout=self.dropout,
+            activation=self.activation,
+            model_seed=self.model_seed,
+            uncertainty="mve"
         )
-        self.model = self.build_model()
 
+        self.std = 1 # to be redefined in self.train()
+        self.mean = 0 # to be redefined in self.train()
         super().__init__(test_batch_size=test_batch_size, **kwargs)
 
     @property
@@ -570,14 +583,44 @@ class NNTwoOutputModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
-    ) -> bool:
-        if retrain:
-            self.model = self.build_model()
+        epochs: int = 500,
+        early_stopping: bool = True
+    ) -> Model:
 
-        return self.model.train(xs, ys, featurizer)
+        self.std = np.mean(ys)
+        self.mean = np.std(ys)
+
+        if retrain:
+            self.model = NN(
+                input_size=self.input_size,
+                num_tasks=1,
+                batch_size=self.test_batch_size,
+                layer_sizes = self.layer_sizes,
+                dropout=self.dropout,
+                activation=self.activation,
+                model_seed=self.model_seed,
+                uncertainty="mve"
+            )
+
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, batch_size=self.batch_size)
+
+        if early_stopping: 
+            callbacks = [EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)]
+        else: 
+            callbacks = []
+
+        self.trainer = pl.Trainer(
+                accelerator="auto",
+                devices=1 if torch.cuda.is_available() else None,
+                max_epochs=epochs,
+                callbacks=callbacks,
+                )
+        self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
+
+        return self.model
 
     def get_means(self, xs: Sequence) -> np.ndarray:
-        preds = self.model.predict(xs)
+        preds = self.model(xs)
         return preds[:, 0]
 
     def get_means_and_vars(self, xs: Sequence) -> Tuple[ndarray, ndarray]:
