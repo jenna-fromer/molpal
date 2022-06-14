@@ -155,7 +155,7 @@ class NN(LightningModule):
         if model_seed: 
             torch.manual_seed(model_seed)
 
-        if self.uncertainty:
+        if self.uncertainty == "mve": # Jenna added =="mve", shouldn't be 2X tasks for dropout??
             output_size = 2*num_tasks
         else:
             output_size = num_tasks
@@ -205,6 +205,7 @@ class NN(LightningModule):
         return loss 
 
     def forward(self,x): 
+        # must change for uncertainty = "dropout"
         return self.model(x)
 
     def save(self, path) -> str:
@@ -639,7 +640,6 @@ class NNTwoOutputModel(Model):
     def unnormalize(self, means):
         return means*self.std + self.mean
  
-
 class NNDropoutModel(Model):
     """Feed forward neural network that uses MC dropout for UQ
 
@@ -703,7 +703,7 @@ class NNDropoutModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
-    ) -> bool:
+    ) -> Model:
         if retrain:
             self.model = self.build_model()
 
@@ -717,13 +717,13 @@ class NNDropoutModel(Model):
         predss = self._get_predss(xs)
         return np.mean(predss, axis=1), np.var(predss, axis=1)
 
-    def _get_predss(self, xs: Sequence) -> ndarray:
+    def _get_predss(self, xs: Sequence) -> ndarray: # needs updating 
         """Get the predictions for each dropout pass"""
         predss = np.zeros((len(xs), self.dropout_size))
         for j in tqdm(
             range(self.dropout_size), leave=False, desc="bootstrap prediction", unit="pass"
         ):
-            predss[:, j] = self.model.predict(xs)[:, 0]
+            predss[:, j] = self.unnormalize(self.model(xs)[:, 0])
 
         return predss
 
@@ -732,3 +732,10 @@ class NNDropoutModel(Model):
 
     def load(self, path):
         self.model.load(path)
+
+    def normalize(self,ys):
+        return (ys-self.mean)/self.std
+
+    def unnormalize(self,means):
+        return means*self.std + self.mean
+
