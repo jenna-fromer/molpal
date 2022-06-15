@@ -1,29 +1,28 @@
 """This module contains Model implementations that utilize an NN model as their
 underlying model"""
+# potential changes: change save/load to work on NN checkpoints not state_dict
 from cmath import pi
 from functools import partial
 import json
 from pathlib import Path
-from types import NoneType
-from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple, TypeVar, Union, NoneType
+from typing import Callable, Iterable, List, NoReturn, Optional, Sequence, Tuple, TypeVar, Union
 import numpy as np
 from numpy import ndarray
 import pytorch_lightning as pl
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+import torch 
+import torch.nn as nn
+from torch.nn import functional 
+from torch.utils.data import Dataset, random_split, DataLoader
+from traitlets import Int
+from molpal.featurizer import Featurizer, feature_matrix
+from molpal.models.base import Model
 import ray 
 from ray import cluster_resources
 from sqlalchemy import Float
 from tqdm import tqdm
 from math import pi
-import torch.nn as nn
-from torch.nn import functional 
-import torch 
-from torch.utils.data import Dataset, random_split, DataLoader
-from traitlets import Int
-
-from molpal.featurizer import Featurizer, feature_matrix
-from molpal.models.base import Model
 
 T = TypeVar("T")
 T_feat = TypeVar("T_feat")
@@ -34,7 +33,7 @@ class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
     def __init__(self, xs: Iterable[T], ys: Sequence[float], featurizer: Featurizer):  
         self.X = torch.tensor(feature_matrix(xs, featurizer)) 
-        self.y = torch.tensor(self._normalize(ys)) 
+        self.y = torch.tensor(ys) 
         self.len = len(list(xs))
         self.xs = list(xs) 
 
@@ -44,11 +43,12 @@ class FingerprintDataset(Dataset):
     def __len__(self) -> Int:
         return self.len 
     
-    def _normalize(self, ys: Sequence[float]) -> ndarray:
-        Y = np.stack(list(ys))
-        self.mean = np.nanmean(Y, axis=0)
-        self.std = np.nanstd(Y, axis=0)
-        return (Y - self.mean) / self.std
+    # normalize ys before making dataset 
+    # def _normalize(self, ys: Sequence[float]) -> ndarray:
+    #    Y = np.stack(list(ys))
+    #    self.mean = np.nanmean(Y, axis=0)
+    #    self.std = np.nanstd(Y, axis=0)
+    #    return (Y - self.mean) / self.std
 
 
 def mve_loss(y_true, y_pred):
@@ -142,7 +142,7 @@ class NN(LightningModule):
         activation: Optional[str] = "relu",
         uncertainty: Optional[str] = None,
         model_seed: Optional[int] = None,
-        lr: Optional[float] = 0.01,
+        lr: Optional[float] = 0.001,
     ):
         super().__init__()
 
@@ -207,7 +207,9 @@ class NN(LightningModule):
         return loss 
 
     def forward(self,x): 
-        # must change for uncertainty = "dropout"
+        self.model.eval()
+        if self.uncertainty == "dropout":
+            self.model.train() # so that the dropout layers remain on for inference
         return self.model(x)
 
     def save(self, path) -> str:
@@ -319,8 +321,8 @@ class NNModel(Model):
         early_stopping: bool = True,
     ) -> Model:
 
-        self.std = np.mean(ys)
-        self.mean = np.std(ys)
+        self.mean = np.nanmean(ys, axis=0)
+        self.std = np.nanstd(ys, axis=0)
         
         if retrain:
             self.model = NN(
@@ -416,7 +418,6 @@ class NNEnsembleModel(Model):
         self.bootstrap_ensemble = bootstrap_ensemble  # TODO: Actually use this
 
         if self.model_seed: # NOT RECOMMENDED, ALL MODELS WILL INITIALIZE IDENTICALLY
-            print('Same random seed being used for ensemble model initiation! (Bad)')
             torch.manual_seed(model_seed)
         
         self.models = [NN(
@@ -452,8 +453,8 @@ class NNEnsembleModel(Model):
         early_stopping: bool = True
     ) -> List[Model]:
 
-        self.std = np.mean(ys)
-        self.mean = np.std(ys)
+        self.mean = np.nanmean(ys, axis=0)
+        self.std = np.nanstd(ys, axis=0)
 
         if retrain:
             self.models = [NN(
@@ -591,8 +592,8 @@ class NNTwoOutputModel(Model):
         early_stopping: bool = True
     ) -> Model:
 
-        self.std = np.mean(ys)
-        self.mean = np.std(ys)
+        self.mean = np.nanmean(ys, axis=0)
+        self.std = np.nanstd(ys, axis=0)
 
         if retrain:
             self.model = NN(
@@ -643,6 +644,7 @@ class NNTwoOutputModel(Model):
     def unnormalize(self, means):
         return means*self.std + self.mean
  
+
 class NNDropoutModel(Model):
     """Feed forward neural network that uses MC dropout for UQ
 
@@ -673,21 +675,36 @@ class NNDropoutModel(Model):
         dropout: Optional[float] = 0.2,
         dropout_size: int = 10,
         model_seed: Optional[int] = None,
+        layer_sizes: Optional[List] = [100,100],
+        activation: Optional[str] = "relu",
         **kwargs,
     ):
-        test_batch_size = test_batch_size or 4096
-
-        self.build_model = partial(
-            NN,
-            input_size=input_size,
-            num_tasks=1,
-            batch_size=test_batch_size,
-            dropout=dropout,
-            uncertainty="dropout",
-            model_seed=model_seed,
-        )
-        self.model = self.build_model()
+        
         self.dropout_size = dropout_size
+        self.input_size = input_size
+        self.test_batch_size = test_batch_size
+        self.dropout = dropout
+        self.model_seed = model_seed
+        self.layer_sizes = layer_sizes
+        self.activation = activation
+        self.batch_size = test_batch_size
+
+        if self.model_seed: 
+            torch.manual_seed(model_seed)
+        
+        self.model = NN(
+            input_size=self.input_size,
+            num_tasks=1,
+            batch_size=self.test_batch_size,
+            layer_sizes = self.layer_sizes,
+            dropout=self.dropout,
+            activation=self.activation,
+            model_seed=self.model_seed,
+            uncertainty="dropout"
+        )
+
+        self.std = 1 # to be redefined in self.train()
+        self.mean = 0 # to be redefined in self.train()
 
         super().__init__(test_batch_size=test_batch_size, **kwargs)
 
@@ -706,11 +723,41 @@ class NNDropoutModel(Model):
         *,
         featurizer: Featurizer,
         retrain: bool = False,
+        epochs: int = 500,
+        early_stopping: bool = True,
     ) -> Model:
-        if retrain:
-            self.model = self.build_model()
 
-        return self.model.train(xs, ys, featurizer)
+        self.std = np.nanstd(ys, axis=0)
+        self.mean = np.nanmean(ys, axis=0)
+
+        if retrain:
+            self.model = NN(
+                input_size=self.input_size,
+                num_tasks=1,
+                batch_size=self.test_batch_size,
+                layer_sizes = self.layer_sizes,
+                dropout=self.dropout,
+                activation=self.activation,
+                model_seed=self.model_seed,
+                uncertainty="dropout"
+            )
+        
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, batch_size=self.batch_size)
+
+        if early_stopping: 
+            callbacks = [EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)]
+        else: 
+            callbacks = []
+
+        self.trainer = pl.Trainer(
+            accelerator="auto",
+            devices=1 if torch.cuda.is_available() else None,
+            max_epochs=epochs,
+            callbacks=callbacks,
+            )
+        self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader) 
+
+        return self.model
 
     def get_means(self, xs: Sequence) -> ndarray:
         predss = self._get_predss(xs)
