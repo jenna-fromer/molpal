@@ -58,7 +58,7 @@ def mve_loss(y_true, y_pred):
         y_true = torch.Tensor(y_pred)
     mu = y_pred[:,0]
     var = functional.softplus(y_pred[:,1])
-
+    # check that below is element-wise 
     return torch.mean(
         torch.log(torch.tensor(2 * pi)) / 2 # use built in constant
         + torch.log(var) / 2
@@ -142,12 +142,14 @@ class NN(LightningModule):
         activation: Optional[str] = "relu",
         uncertainty: Optional[str] = None,
         model_seed: Optional[int] = None,
+        lr: Optional[float] = 0.01,
     ):
         super().__init__()
 
         self.input_size = input_size
         self.batch_size = batch_size
         self.uncertainty = uncertainty
+        self.lr = lr
 
         self.mean = 0 # to be mutated in self.train() later
         self.std = 1 # to be mutated in self.train()
@@ -186,9 +188,9 @@ class NN(LightningModule):
     
     def configure_optimizers(self):
         if self.uncertainty not in {"mve"}:
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         elif self.uncertainty == "mve":
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=0.05)
+            optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         else:
             raise ValueError(f'Unrecognized uncertainty method: "{self.uncertainty}"')
         return optimizer
@@ -511,6 +513,7 @@ class NNEnsembleModel(Model):
 
     def unnormalize(self, y_pred):
         return y_pred*self.std + self.mean 
+
 
 class NNTwoOutputModel(Model):
     """Feed forward neural network with two outputs so it learns to predict
