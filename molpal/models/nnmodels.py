@@ -1,6 +1,7 @@
 """This module contains Model implementations that utilize an NN model as their
 underlying model"""
 # potential changes: change save/load to work on NN checkpoints not state_dict
+from ast import Str
 from cmath import pi
 from functools import partial
 import json
@@ -16,6 +17,7 @@ import torch.nn as nn
 from torch.nn import functional 
 from torch.utils.data import Dataset, random_split, DataLoader
 from traitlets import Int
+from yaml import SequenceEndEvent
 from molpal.featurizer import Featurizer, feature_matrix
 from molpal.models.base import Model
 import ray 
@@ -32,8 +34,8 @@ T_feat = TypeVar("T_feat")
 class FingerprintDataset(Dataset):
     """ A pytorch dataset containing a list of molecular fingerprints and output values """
     def __init__(self, xs: Iterable[T], ys: Sequence[float], featurizer: Featurizer):  
-        self.X = torch.tensor(feature_matrix(xs, featurizer)) 
-        self.y = torch.tensor(ys) 
+        self.X = torch.tensor(feature_matrix(xs, featurizer)).float() 
+        self.y = torch.tensor(ys).float()
         self.len = len(list(xs))
         self.xs = list(xs) 
 
@@ -42,27 +44,19 @@ class FingerprintDataset(Dataset):
 
     def __len__(self) -> Int:
         return self.len 
-    
-    # normalize ys before making dataset 
-    # def _normalize(self, ys: Sequence[float]) -> ndarray:
-    #    Y = np.stack(list(ys))
-    #    self.mean = np.nanmean(Y, axis=0)
-    #    self.std = np.nanstd(Y, axis=0)
-    #    return (Y - self.mean) / self.std
 
 
-def mve_loss(y_true, y_pred):
+def mve_loss(y_true: Union[torch.tensor,np.array], y_pred: Union[torch.tensor, np.array]) -> torch.tensor:
     if not isinstance(y_pred,torch.Tensor): 
-        y_pred = torch.Tensor(y_pred)
+        y_pred = torch.tensor(y_pred)
     if not isinstance(y_true,torch.Tensor): 
-        y_true = torch.Tensor(y_pred)
+        y_true = torch.tensor(y_pred)
     mu = y_pred[:,0]
     var = functional.softplus(y_pred[:,1])
-    # check that below is element-wise 
     return torch.mean(
-        torch.log(torch.tensor(2 * pi)) / 2 # use built in constant
+        torch.log(torch.tensor(2 * pi)) / 2 
         + torch.log(var) / 2
-        + torch.square(mu - y_true) / (2 * var) # or **2, same thing as squared
+        + torch.square(mu - y_true) / (2 * var)
     )
 
 def make_dataloaders(
@@ -197,22 +191,22 @@ class NN(LightningModule):
     
     def training_step(self, train_batch: tuple, batch_idx):
         X, y = train_batch
-        loss = self.loss(y, self.model(X)) 
+        loss = self.loss(y, self.model(X).squeeze()) 
         return loss 
     
     def validation_step(self, batch: tuple, batch_idx):
         X, y = batch
-        loss = self.loss(y, self.model(X))
+        loss = self.loss(y, self.model(X).squeeze()) # BUT X IS A FLOAT64????
         self.log("val_loss", loss, prog_bar=True)
         return loss 
 
-    def forward(self,x): 
+    def forward(self, x: torch.tensor): 
         self.model.eval()
         if self.uncertainty == "dropout":
             self.model.train() # so that the dropout layers remain on for inference
         return self.model(x)
 
-    def save(self, path) -> str:
+    def save(self, path: Union[Path,Str]) -> str:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
@@ -237,7 +231,7 @@ class NN(LightningModule):
         else:
             custom_objects = {}
 
-        self.model.load_state_dict(torch.load(model_path))
+        self.model.load_state_dict(torch.load(model_path)) # add custom objects?
         
         return self.model
 
@@ -323,6 +317,7 @@ class NNModel(Model):
 
         self.mean = np.nanmean(ys, axis=0)
         self.std = np.nanstd(ys, axis=0)
+        self.featurizer = featurizer
         
         if retrain:
             self.model = NN(
@@ -352,16 +347,17 @@ class NNModel(Model):
 
         return self.model
 
-    def get_means(self, xs: List) -> ndarray:
-        return self.model(xs)[:, 0] # why is it this way?? 
+    def get_means(self, xs: Sequence[str]) -> ndarray: # SHOULD THIS RETURN ARRAY OR TENSOR 
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
+        return self.unnormalize(self.model(xs)[:, 0])  
 
     def get_means_and_vars(self, xs: List) -> NoReturn:
         raise TypeError("NNModel can't predict variances!")
 
-    def save(self, path) -> str:
+    def save(self, path: Union[str, Path]) -> str:
         return self.model.save(path)
 
-    def load(self, path):
+    def load(self, path: Union[str, Path]):
         self.model.load(path)
     
     def normalize(self, ys):
@@ -455,6 +451,7 @@ class NNEnsembleModel(Model):
 
         self.mean = np.nanmean(ys, axis=0)
         self.std = np.nanstd(ys, axis=0)
+        self.featurizer = featurizer
 
         if retrain:
             self.models = [NN(
@@ -481,38 +478,40 @@ class NNEnsembleModel(Model):
       
         return self.models
 
-    def get_means(self, xs: Sequence) -> np.ndarray:
+    def get_means(self, xs: Sequence[str]) -> np.ndarray:
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         preds = np.zeros((len(xs), len(self.models)))
         for j, model in tqdm(
             enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
         ):
-            preds[:, j] = self.unnormalize(model.predict(xs)[:, 0])
+            preds[:, j] = self.unnormalize(model(xs)[:, 0]).cpu().detach().numpy()
 
         return np.mean(preds, axis=1)
 
-    def get_means_and_vars(self, xs: Sequence) -> Tuple[np.ndarray, np.ndarray]:
+    def get_means_and_vars(self, xs: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         preds = np.zeros((len(xs), len(self.models)))
         for j, model in tqdm(
             enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
         ):
-            preds[:, j] = self.unnormalize(model.predict(xs)[:, 0])
+            preds[:, j] = self.unnormalize(model(xs)[:, 0]).cpu().detach().numpy()
 
         return np.mean(preds, axis=1), np.var(preds, axis=1)
 
-    def save(self, path) -> str:
+    def save(self, path: Union[str, Path]) -> str:
         for i, model in enumerate(self.models):
             model.save(path, f"model_{i}")
 
         return path
 
-    def load(self, path):
+    def load(self, path: Union[str, Path]):
         for model, model_path in zip(self.models, path.iterdir()):
             model.load(model_path)
     
-    def normalize(self, ys):
+    def normalize(self, ys: Union[Sequence[float],float]):
         return (ys-self.mean)/self.std
 
-    def unnormalize(self, y_pred):
+    def unnormalize(self, y_pred: Union[Sequence[float],float]):
         return y_pred*self.std + self.mean 
 
 
@@ -632,16 +631,16 @@ class NNTwoOutputModel(Model):
         preds = self.model(xs)
         return self.unnormalize(preds[:, 0]), functional.softplus(preds[:, 1])
 
-    def save(self, path) -> str:
+    def save(self, path: Union[str,Path]) -> str:
         return self.model.save(path)
 
-    def load(self, path):
+    def load(self, path: Union[str,Path]):
         self.model.load(path)
     
-    def normalize(self, ys):
+    def normalize(self, ys: Union[Sequence[float],float]) -> Union[Sequence,Float]:
         return (ys-self.mean)/self.std
 
-    def unnormalize(self, means):
+    def unnormalize(self, means: Union[Sequence[float],float]) -> Union[Sequence,Float]:
         return means*self.std + self.mean
  
 
@@ -783,9 +782,9 @@ class NNDropoutModel(Model):
     def load(self, path):
         self.model.load(path)
 
-    def normalize(self,ys):
+    def normalize(self,ys: Union[Sequence[float],float]):
         return (ys-self.mean)/self.std
 
-    def unnormalize(self,means):
+    def unnormalize(self,means: Union[Sequence[float],float]):
         return means*self.std + self.mean
 
