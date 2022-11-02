@@ -151,7 +151,7 @@ class NN(LightningModule):
         if model_seed: 
             torch.manual_seed(model_seed)
 
-        if self.uncertainty == "mve": # Jenna added =="mve", shouldn't be 2X tasks for dropout??
+        if self.uncertainty == "mve":
             output_size = 2*num_tasks
         else:
             output_size = num_tasks
@@ -162,21 +162,48 @@ class NN(LightningModule):
                 'leakyrelu': nn.LeakyReLU()
                 }
 
-        self.model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
+        # Create FFN layers
+        if len(layer_sizes) == 0:
+            ffn = [
+                nn.Dropout(p=dropout),
+                nn.Linear(input_size, output_size)
+            ]
+        else:
+            ffn = [
+                nn.Dropout(p=dropout),
+                nn.Linear(input_size, layer_sizes[0])
+            ]
+            for i in range(len(layer_sizes)-1):
+                ffn.extend([
+                    activations[activation],
+                    nn.Dropout(p=dropout),
+                    nn.Linear(layer_sizes[i], layer_sizes[i+1]),
+                ])
+            ffn.extend([
+                activations[activation],
+                nn.Dropout(p=dropout),
+                nn.Linear(layer_sizes[-1], output_size),
+            ])
+
+        # self.model = nn.Sequential(nn.Linear(input_size, layer_sizes[0]))
         # see chemprop blob sent 
-        for i in range(1,len(layer_sizes)):
-            self.model.append(activations[activation])
-            self.model.append(nn.Dropout(p=dropout))
-            self.model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
+        # for i in range(1,len(layer_sizes)):
+        #     self.model.append(activations[activation])
+        #     self.model.append(nn.Dropout(p=dropout))
+        #     self.model.append(nn.Linear(layer_sizes[i-1],layer_sizes[i]))
         
-        self.model.append(activations[activation])
-        self.model.append(nn.Dropout(p=dropout))
-        self.model.append(nn.Linear(layer_sizes[-1],output_size)) 
+        # self.model.append(activations[activation])
+        # self.model.append(nn.Dropout(p=dropout))
+        # self.model.append(nn.Linear(layer_sizes[-1],output_size)) 
+
+        self.model = nn.Sequential(*ffn)
 
         if uncertainty not in {"mve"}:
             self.loss = nn.MSELoss()
         elif uncertainty == "mve":
             self.loss = mve_loss
+        elif uncertainty == "dropout":
+            pass
         else:
             raise ValueError(f'Unrecognized uncertainty method: "{uncertainty}"')
     
@@ -347,9 +374,9 @@ class NNModel(Model):
 
         return self.model
 
-    def get_means(self, xs: Sequence[str]) -> ndarray: # SHOULD THIS RETURN ARRAY OR TENSOR 
+    def get_means(self, xs: Sequence[str]) -> np.ndarray:
         xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
-        return self.unnormalize(self.model(xs)[:, 0])  
+        return self.unnormalize(self.model(xs)[:, 0]).cpu().detach().numpy()
 
     def get_means_and_vars(self, xs: List) -> NoReturn:
         raise TypeError("NNModel can't predict variances!")
@@ -406,15 +433,15 @@ class NNEnsembleModel(Model):
         self.input_size = input_size
         self.test_batch_size = test_batch_size
         self.dropout = dropout
-        self.model_seed = model_seed
+        self.model_seed = model_seed # NOT RECOMMENDED, ALL MODELS WILL INITIALIZE IDENTICALLY
         self.layer_sizes = layer_sizes
         self.activation = activation
         self.batch_size = test_batch_size
         self.ensemble_size = ensemble_size        
         self.bootstrap_ensemble = bootstrap_ensemble  # TODO: Actually use this
 
-        if self.model_seed: # NOT RECOMMENDED, ALL MODELS WILL INITIALIZE IDENTICALLY
-            torch.manual_seed(model_seed)
+        # if self.model_seed: 
+        #    torch.manual_seed(model_seed)
         
         self.models = [NN(
                 input_size=self.input_size,
@@ -466,10 +493,16 @@ class NNEnsembleModel(Model):
 
         self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, self.batch_size)
 
+        if early_stopping: 
+            callbacks = [EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)]
+        else: 
+            callbacks = []
+
         self.trainers = [ pl.Trainer(
                 accelerator="auto",
                 devices=1 if torch.cuda.is_available() else None,
                 max_epochs=epochs,
+                callbacks=callbacks,
                 # log_every_n_steps=len(self.train_dataloader),
                 ) for _ in range(self.ensemble_size)]
         
@@ -591,8 +624,9 @@ class NNTwoOutputModel(Model):
         early_stopping: bool = True
     ) -> Model:
 
-        self.mean = np.nanmean(ys, axis=0)
+        self.mean = np.nanmean(ys, axis=0) 
         self.std = np.nanstd(ys, axis=0)
+        self.featurizer = featurizer
 
         if retrain:
             self.model = NN(
@@ -606,7 +640,7 @@ class NNTwoOutputModel(Model):
                 uncertainty="mve"
             )
 
-        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, self.normalize(ys), featurizer, batch_size=self.batch_size)
+        self.train_dataloader, self.val_dataloader = make_dataloaders(xs, ys, featurizer, batch_size=self.batch_size)
 
         if early_stopping: 
             callbacks = [EarlyStopping(monitor="val_loss", mode="min", patience=5, verbose=0)]
@@ -624,25 +658,30 @@ class NNTwoOutputModel(Model):
         return self.model
 
     def get_means(self, xs: Sequence) -> np.ndarray:
-        preds = self.unnormalize(self.model(xs))
-        return self.unnormalize(preds[:, 0])
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
+        preds = self.model(xs)
+        return preds[:, 0].cpu().detach().numpy()
 
     def get_means_and_vars(self, xs: Sequence) -> Tuple[ndarray, ndarray]:
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         preds = self.model(xs)
-        return self.unnormalize(preds[:, 0]), functional.softplus(preds[:, 1])
+        return self.unnormalize_means(preds[:, 0]).cpu().detach().numpy(), self.unnormalize_vars(functional.softplus(preds[:, 1])).cpu().detach().numpy()
 
     def save(self, path: Union[str,Path]) -> str:
         return self.model.save(path)
 
     def load(self, path: Union[str,Path]):
         self.model.load(path)
-    
-    def normalize(self, ys: Union[Sequence[float],float]) -> Union[Sequence,Float]:
+
+    def normalize(self, ys: Union[Sequence[float],float]):
         return (ys-self.mean)/self.std
 
-    def unnormalize(self, means: Union[Sequence[float],float]) -> Union[Sequence,Float]:
-        return means*self.std + self.mean
- 
+    def unnormalize_means(self, y_pred: Union[Sequence[float],float]):
+        return y_pred*self.std + self.mean 
+
+    def unnormalize_vars(self, vars: Union[Sequence[float],float]):
+        return (vars*self.std + self.mean)*(self.std ** 2) 
+
 
 class NNDropoutModel(Model):
     """Feed forward neural network that uses MC dropout for UQ
@@ -662,7 +701,7 @@ class NNDropoutModel(Model):
         the size into which inputs should be batched
         during training and inference
     dropout : Optional[float] (Default = 0.0)
-        the dropout probability during training
+        the dropout probability during training and inference (for uncertainty)
     dropout_size : int (Default = 10)
         the number of passes to make through the network during inference
     """
@@ -728,6 +767,7 @@ class NNDropoutModel(Model):
 
         self.std = np.nanstd(ys, axis=0)
         self.mean = np.nanmean(ys, axis=0)
+        self.featurizer = featurizer
 
         if retrain:
             self.model = NN(
@@ -768,11 +808,12 @@ class NNDropoutModel(Model):
 
     def _get_predss(self, xs: Sequence) -> ndarray: # needs updating 
         """Get the predictions for each dropout pass"""
+        xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         predss = np.zeros((len(xs), self.dropout_size))
         for j in tqdm(
             range(self.dropout_size), leave=False, desc="bootstrap prediction", unit="pass"
         ):
-            predss[:, j] = self.unnormalize(self.model(xs)[:, 0])
+            predss[:, j] = self.unnormalize(self.model(xs)[:, 0]).detach()
 
         return predss
 
