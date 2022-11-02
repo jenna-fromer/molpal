@@ -421,7 +421,7 @@ class NNEnsembleModel(Model):
     def __init__(
         self,
         input_size: int,
-        test_batch_size: Optional[int] = 4096,
+        test_batch_size: Optional[int] = 8192,
         dropout: Optional[float] = 0.0,
         ensemble_size: int = 5,
         bootstrap_ensemble: Optional[bool] = False,
@@ -515,21 +515,21 @@ class NNEnsembleModel(Model):
         xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         preds = np.zeros((len(xs), len(self.models)))
         for j, model in tqdm(
-            enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
+            enumerate(self.models), "ensemble prediction", leave=False, unit="model"
         ):
             preds[:, j] = self.unnormalize(model(xs)[:, 0]).cpu().detach().numpy()
 
-        return np.mean(preds, axis=1)
+        return np.mean(preds, 0)
 
     def get_means_and_vars(self, xs: Sequence[str]) -> Tuple[np.ndarray, np.ndarray]:
         xs = torch.tensor(feature_matrix(xs, self.featurizer)).float()
         preds = np.zeros((len(xs), len(self.models)))
         for j, model in tqdm(
-            enumerate(self.models), leave=False, desc="ensemble prediction", unit="model"
+            enumerate(self.models), "ensemble prediction", leave=False, unit="model"
         ):
             preds[:, j] = self.unnormalize(model(xs)[:, 0]).cpu().detach().numpy()
 
-        return np.mean(preds, axis=1), np.var(preds, axis=1)
+        return np.mean(preds, 0), np.var(preds, 0)
 
     def save(self, path: Union[str, Path]) -> str:
         for i, model in enumerate(self.models):
@@ -571,7 +571,7 @@ class NNTwoOutputModel(Model):
     def __init__(
         self,
         input_size: int,
-        test_batch_size: Optional[int] = 4096,
+        test_batch_size: Optional[int] = 8192,
         dropout: Optional[float] = 0.0,
         model_seed: Optional[int] = None,
         layer_sizes: Optional[List] = [100,100],
@@ -709,7 +709,7 @@ class NNDropoutModel(Model):
     def __init__(
         self,
         input_size: int,
-        test_batch_size: Optional[int] = 4096,
+        test_batch_size: Optional[int] = 8192,
         dropout: Optional[float] = 0.2,
         dropout_size: int = 10,
         model_seed: Optional[int] = None,
@@ -800,11 +800,11 @@ class NNDropoutModel(Model):
 
     def get_means(self, xs: Sequence) -> ndarray:
         predss = self._get_predss(xs)
-        return np.mean(predss, axis=1)
+        return np.mean(predss, 0)
 
     def get_means_and_vars(self, xs: Sequence) -> Tuple[ndarray, ndarray]:
         predss = self._get_predss(xs)
-        return np.mean(predss, axis=1), np.var(predss, axis=1)
+        return np.mean(predss, 0), np.var(predss, 0)
 
     def _get_predss(self, xs: Sequence) -> ndarray: # needs updating 
         """Get the predictions for each dropout pass"""

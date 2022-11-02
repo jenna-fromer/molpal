@@ -1,23 +1,16 @@
 from configargparse import ArgumentTypeError, ArgumentParser, Namespace
-from typing import Optional, Union
+from typing import Union
 
 
-def gen_args(args: Optional[str] = None) -> Namespace:
-    parser = ArgumentParser()
-
+def add_args(parser: ArgumentParser):
     add_general_args(parser)
-    add_encoder_args(parser)
+    add_featurizer_args(parser)
     add_pool_args(parser)
+    add_prune_args(parser)
     add_acquisition_args(parser)
     add_objective_args(parser)
     add_model_args(parser)
     add_stopping_args(parser)
-
-    args = parser.parse_args(args)
-
-    cleanup_args(args)
-
-    return args
 
 
 #################################
@@ -48,13 +41,11 @@ def add_general_args(parser: ArgumentParser) -> None:
     parser.add_argument(
         "--write-intermediate",
         action="store_true",
-        default=False,
         help="whether to write a summary file with all of the explored inputs and their associated scores after each round of exploration",
     )
     parser.add_argument(
         "--write-final",
         action="store_true",
-        default=False,
         help="whether to write a summary file with all of the explored inputs and their associated scores",
     )
 
@@ -81,15 +72,16 @@ def add_general_args(parser: ArgumentParser) -> None:
     )
 
 
-#####################################
-#       ENCODER ARGUMENTS           #
-#####################################
-def add_encoder_args(parser: ArgumentParser) -> None:
+########################################
+#       FEATURIZER ARGUMENTS           #
+########################################
+def add_featurizer_args(parser: ArgumentParser):
+    parser = parser.add_argument_group("FEATURIZER")
     parser.add_argument(
         "--fingerprint",
         default="pair",
         choices={"morgan", "rdkit", "pair", "maccs", "map4"},
-        help="the type of encoder to use",
+        help="the type of fingerprint to use",
     )
     parser.add_argument(
         "--radius", type=int, default=2, help="the radius or path length to use for fingerprints"
@@ -100,8 +92,11 @@ def add_encoder_args(parser: ArgumentParser) -> None:
 ##############################
 #       POOL ARGUMENTS       #
 ##############################
-def add_pool_args(parser: ArgumentParser) -> None:
-    parser.add_argument("--pool", default="eager", help="the type of MoleculePool to use")
+def add_pool_args(parser: ArgumentParser):
+    parser = parser.add_argument_group("POOL")
+    parser.add_argument(
+        "--pool", default="eager", choices=("eager", "lazy"), help="the type of MoleculePool to use"
+    )
     parser.add_argument(
         "-l",
         "--libraries",
@@ -113,7 +108,6 @@ def add_pool_args(parser: ArgumentParser) -> None:
     parser.add_argument(
         "--no-title-line",
         action="store_true",
-        default=False,
         help="whether there is no title line in the library files",
     )
     parser.add_argument(
@@ -126,10 +120,7 @@ def add_pool_args(parser: ArgumentParser) -> None:
         help="the column containing the SMILES string in the library files",
     )
     parser.add_argument(
-        "--cxsmiles",
-        default=False,
-        action="store_true",
-        help="whether the files use CXSMILES strings",
+        "--cxsmiles", action="store_true", help="whether the files use CXSMILES strings"
     )
     parser.add_argument(
         "--fps",
@@ -137,7 +128,7 @@ def add_pool_args(parser: ArgumentParser) -> None:
         help="an HDF5 file containing the precalculated feature representation of each molecule in the pool",
     )
     parser.add_argument(
-        "--cluster", action="store_true", default=False, help="whether to cluster the MoleculePool"
+        "--cluster", action="store_true", help="whether to cluster the MoleculePool"
     )
     parser.add_argument(
         "--cache",
@@ -150,14 +141,24 @@ def add_pool_args(parser: ArgumentParser) -> None:
         "--invalid-lines",
         type=int,
         nargs="*",
-        help="the indices in the overall library (potentially consisting of multiple library files) containing invalid SMILES strings",
+        help="the indices in the overall library (potentially consisting of multiple library files) containing invalid SMILES strings. Adding this flag with 0 arguments corresponds to a library with _0_ invalid SMILES strings.",
     )
+
+
+#################################
+#       PRUNING ARGUMENTS       #
+#################################
+def add_prune_args(parser):
+    parser = parser.add_argument_group("PRUNING")
+    parser.add_argument("--prune", action="store_true")
+    parser.add_argument("--prune-min-hit-prob", type=restricted_float)
 
 
 #####################################
 #       ACQUISITION ARGUMENTS       #
 #####################################
-def add_acquisition_args(parser: ArgumentParser) -> None:
+def add_acquisition_args(parser: ArgumentParser):
+    parser = parser.add_argument_group("ACQUISITION")
     parser.add_argument(
         "--metric",
         "--alpha",
@@ -211,7 +212,8 @@ def add_acquisition_args(parser: ArgumentParser) -> None:
 ###################################
 #       OBJECTIVE ARGUMENTS       #
 ###################################
-def add_objective_args(parser: ArgumentParser) -> None:
+def add_objective_args(parser: ArgumentParser):
+    parser = parser.add_argument_group("OBJECTIVE")
     parser.add_argument(
         "-o",
         "--objective",
@@ -220,10 +222,7 @@ def add_objective_args(parser: ArgumentParser) -> None:
         help="the objective function to use",
     )
     parser.add_argument(
-        "--minimize",
-        action="store_true",
-        default=False,
-        help="whether to minimize the objective function",
+        "--minimize", action="store_true", help="whether to minimize the objective function"
     )
     parser.add_argument(
         "--objective-config",
@@ -234,32 +233,32 @@ def add_objective_args(parser: ArgumentParser) -> None:
 ###############################
 #       MODEL ARGUMENTS       #
 ###############################
-def add_model_args(parser: ArgumentParser) -> None:
-    parser.add_argument(
+def add_model_args(parser: ArgumentParser):
+    model_parser = parser.add_argument_group("MODEL")
+    model_parser.add_argument(
         "--model", choices=("rf", "gp", "nn", "mpn"), default="rf", help="the model type to use"
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--test-batch-size",
         type=int,
-        help="the size of batch of predictions during model inference. NOTE: This has nothing to do with model training/performance and might only affect the timing of the inference step. It is only useful to play with this parameter if performance is absolutely critical.",
+        help="the size of batch of predictions during model inference. NOTE: This is *not* the batch sized during model training (if training is done using minibatches). This parameter only controls speed during the model inference and is only useful to modify if performance is critical.",
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--retrain-from-scratch",
         action="store_true",
         default=False,
         help="whether the model should be retrained from scratch at each iteration as opposed to retraining online.",
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--model-seed",
         type=int,
         help="the random seed to use for model initialization. Not specifying will result in random model initializations each time the model is trained.",
     )
 
-    # RF args
-    parser.add_argument(
+    model_parser.add_argument(
         "--n-estimators", type=int, default=100, help="the number of trees in the forest"
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--max-depth",
         nargs="?",
         type=int,
@@ -267,46 +266,35 @@ def add_model_args(parser: ArgumentParser) -> None:
         default=8,
         help="the maximum depth of the tree. Not specifying this argument at all will default to 8. Adding the flag without specifying number a number will default to an unlimited depth",
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--min-samples-leaf",
         type=int,
         default=1,
         help="the minimum number of samples required to be at a leaf node",
     )
-    # GP args
-    parser.add_argument(
+
+    model_parser.add_argument(
         "--gp-kernel",
         choices={"dotproduct"},
         default="dotproduct",
         help="Kernel to use for Gaussian Process model",
     )
 
-    # MPNN args
-    parser.add_argument(
+    model_parser.add_argument(
         "--init-lr", type=float, default=1e-4, help="the initial learning rate for the MPNN model"
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--max-lr", type=float, default=1e-3, help="the maximum learning rate for the MPNN model"
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--final-lr", type=float, default=1e-4, help="the final learning rate for the MPNN model"
     )
-
-    # NN/MPNN args
-    parser.add_argument(
-        "--conf-method",
-        default="none",
-        choices={"ensemble", "twooutput", "mve", "dropout", "none"},
-        help="Confidence estimation method for NN/MPNN models",
-    )
-
-    parser.add_argument(
+    model_parser.add_argument(
         "--ddp",
         action="store_true",
-        default=False,
         help="Whether to perform distributed MPN training over a multi-GPU setup via PyTorch DDP. Currently only works with CUDA >= 11.0",
     )
-    parser.add_argument(
+    model_parser.add_argument(
         "--precision",
         type=int,
         default=32,
@@ -314,11 +302,19 @@ def add_model_args(parser: ArgumentParser) -> None:
         help="the precision to use when training PyTorch models in number of bits. Native precision is 32, but 16-bit precision can lead to lower memory footprint during training and faster training times on Volta GPUs. DO NOT use 16-bit precision on non-Volta GPUs. Currently only supported for single-GPU training (i.e., ddp=False)",
     )
 
+    model_parser.add_argument(
+        "--conf-method",
+        default="none",
+        choices={"ensemble", "twooutput", "mve", "dropout", "none"},
+        help="Confidence estimation method for NN/MPNN models",
+    )
+
 
 ##################################
 #       STOPPING ARGUMENTS       #
 ##################################
-def add_stopping_args(parser: ArgumentParser) -> None:
+def add_stopping_args(parser: ArgumentParser):
+    parser = parser.add_argument_group("STOPPING")
     parser.add_argument(
         "-k",
         "--top-k",
@@ -351,7 +347,7 @@ def add_stopping_args(parser: ArgumentParser) -> None:
     )
 
 
-def cleanup_args(args: Namespace):
+def clean_and_fix_args(args: Namespace):
     """Remove unnecessary attributes and change some arguments"""
     if isinstance(args.scores_csvs, list) and len(args.scores_csvs) == 1:
         args.scores_csvs = args.scores_csvs[0]
@@ -377,9 +373,12 @@ def cleanup_args(args: Namespace):
     if args.model != "nn":
         args_to_remove |= set()
     if args.model != "mpn":
-        args_to_remove |= {"init_lr", "max_lr", "final_lr"}
+        args_to_remove |= {"init_lr", "max_lr", "final_lr", "ddp", "precision"}
     if args.model != "nn" and args.model != "mpn":
         args_to_remove |= {"conf_method"}
+
+    if not args.prune:
+        args_to_remove |= {"prune_min_hit_prob"}
 
     for arg in args_to_remove:
         delattr(args, arg)
@@ -407,7 +406,3 @@ def restricted_float(arg: str) -> float:
         raise ArgumentTypeError(f"{value} must be in [0,1]")
 
     return value
-
-
-def optional_int(arg: str):
-    pass

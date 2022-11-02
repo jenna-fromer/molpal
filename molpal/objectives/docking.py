@@ -61,10 +61,10 @@ class DockingObjective(Objective):
             args.reduction,
             args.receptor_reduction,
             args.k,
-            verbose,
         )
 
         atexit.register(self.cleanup)
+
         super().__init__(minimize=minimize)
 
     def forward(self, smis: Iterable[str], **kwargs) -> Dict[str, Optional[float]]:

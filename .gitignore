@@ -162,6 +162,7 @@ cython_debug/
 *.pdf
 *.json
 *.ini
+*~
 
 .vscode/
 .DS_Store
@@ -177,5 +178,7 @@ lightning_logs
 prep_glide_csv.py
 *.bz2
 *.cxsmiles
+extract_smis.py
+
 void/
 notebooks/
